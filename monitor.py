@@ -144,9 +144,7 @@ class ServerWork(threading.Thread):
     def run(self):
         cache = {}
         while self.alive:
-            datas = [{'ip': socket.gethostbyname(socket.gethostname()),
-                      'host': socket.gethostname(),
-                      'list': collectData()}]
+            datas = list()
             while 1:
                 try:
                     data = self.queue.get_nowait()
@@ -155,11 +153,9 @@ class ServerWork(threading.Thread):
                     break
             if datas:
                 msg = []
-                # msg.append(cdhServerStatus())
-                # msg.append(sparkTaskStatus(cache))
-                # msg.append(mysqlSyncStatus())
+                for func in [cdhServerStatus, sparkTaskStatus, mysqlSyncStatus]:
+                    msg.append(func(cache))
 
-                # !<主机的check无法运行>
                 for i in datas:
                     if "ip" in i and "list" in i:
                         for j in i['list']:
@@ -180,8 +176,9 @@ class ServerWork(threading.Thread):
             time.sleep(60)
 
 
-def cdhServerStatus():
+def cdhServerStatus(cache):
     cdh_status = list()
+    cache.setdefault('cdh_status', set())
 
     host = "http://%s/api/v11/clusters/cluster1/services" % config.CDH[0]
     try:
@@ -198,7 +195,11 @@ def cdhServerStatus():
     ret.raise_for_status()
     for i in ret.json()['items']:
         if i['healthSummary'] != 'GOOD':
-            cdh_status.append(i['name'])
+            if i['name'] not in cache['cdh_status']:
+                cdh_status.append(i['name'])
+                cache['cdh_status'].add(i['name'])
+        else:
+            cache['cdh_status'].remove(i['name'])
 
     if cdh_status:
         return "CDH %s" % ",".join(cdh_status)
@@ -234,8 +235,9 @@ def sparkTaskStatus(cache):
         return ""
 
 
-def mysqlSyncStatus():
+def mysqlSyncStatus(cache):
     cmd = "mysql -u{User} -p{Password} -h{Host} -P{Port} -e 'show slave status \\G'"
+    cache.setdefault('mysql', True)
 
     for h in config.Mysql:
         ip, port = h.split(':')
@@ -247,9 +249,10 @@ def mysqlSyncStatus():
         ret = p.read()
         p.close()
 
-        if "Slave_IO_Running: Yes" in ret and "Slave_SQL_Running: Yes" in ret:
+        if "Slave_IO_Running: Yes" not in ret and "Slave_SQL_Running: Yes" not in ret and cache['mysql']:
+            cache['mysql'] = False
             return u"Mysql 同步异常:%s" % ip
-
+    cache['mysql'] = True
     return ""
 
 
@@ -266,9 +269,13 @@ class Server(threading.Thread):
         self.work = ServerWork(logger=logger, queue=self.queue)
         self.work.start()
 
+        self.cli = Client(ip='0.0.0.0', port=config.ServerPort, logger=logger)
+        self.cli.start()
+
     def stop(self):
         self.alive = False
         self.work.stop()
+        self.cli.stop()
 
     def run(self):
         def handle_request(conn, address):
