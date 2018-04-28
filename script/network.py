@@ -2,34 +2,45 @@
 # encoding: utf-8
 
 import os
+import socket
+
+Rules = "universal"  # universal,master,node
 
 
 def monitor():
-    ret = {}
-    # for h in ["rjbdmaster1", "rjbdmaster2", "rjbdnode1", "rjbdnode2", "rjbdnode3"]:
-    for h in ["114.114.114.114", "www.baidu.com", "172.1.1.1"]:
-        try:
-            p = os.popen("ping %s -c 3" % h)
-            ms = p.read().strip().split('\n')[-1].split(' ')[-2].split('/')
-            p.close()
-            ret[h] = {
-                'min': ms[0],
-                'avg': ms[1],
-                'max': ms[2],
-                'mdev': ms[3]
-            }
-        except (Exception, ):
-            ret[h] = {}
+    ip = socket.gethostbyname(socket.gethostname())
+    p = os.popen("ifconfig")
+    ifconfig = p.read().split(": flags=")
+    p.close()
 
-    return ret
+    idx = 0
+    for row in range(0, len(ifconfig)):
+        if ip in ifconfig[row]:
+            idx = row-1
+            break
+
+    net = filter(lambda x: x, ifconfig[idx].split('\n'))[-1]
+
+    p = os.popen("ethtool %s | grep Speed" % net)
+    speedMsg = p.read().strip().split(" ")[-1]
+    p.close()
+
+    speed = -1
+    for i in range(len(speedMsg), -1, -1):
+        if speedMsg[0:i].isdigit():
+            speed = int(speedMsg[0:i])
+            break
+
+    return {
+        'speed': speed,
+        'unit': speedMsg.replace(str(speed), '')
+    }
 
 
-def check(data):
-    badHost = []
-    for host in data:
-        if not data[host] or eval(data[host]['avg']) > 1000:
-            badHost.append(host)
-    if badHost:
-        return "To %s Timeout/slowly" % ",".join(badHost)
-    else:
-        return ""
+def check(data, cache):
+    if "Mb" not in data['unit']:
+        return False, "Speed unit != Mb/s:%s" % data['unit']
+    if data['speed'] < 1000:
+        return False, "Speed Slow:%d" % data['speed']
+
+    return True, "Speed Recover(%d%s)" % (data['speed'], data['unit'])

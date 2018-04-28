@@ -106,26 +106,19 @@ class Client(threading.Thread):
                 self.logger("Send Data Error")
 
             sock.close()
-            time.sleep(60)
+            time.sleep(config.CollectInterval)
 
 
 def collectData():
-    modules = list(
-        filter(lambda x: "monitor" in __import__(x).__dict__,
-               map(lambda x: x.replace('.py', ''),
-                   filter(lambda x: ".py" in x and ".pyc" not in x,
-                          os.listdir(os.getcwd() + "/script")))))
-
     monitorDatas = {
         "host": socket.gethostname(),
         "ip": socket.gethostbyname(socket.gethostname()),
         'list': []
     }
 
-    for m in modules:
-        func = __import__(m).monitor
+    for m in filter(lambda x: "monitor" in gRemoteModules.get(x, {})):
         try:
-            monitorDatas['list'].append({"name": m, "data": func()})
+            monitorDatas['list'].append({"name": m, "data": gRemoteModules[m]['monitor']()})
         except (Exception,):
             pass
     return monitorDatas
@@ -157,28 +150,35 @@ class ServerWork(threading.Thread):
                     msg.append(func(cache))
 
                 for i in datas:
-                    if "ip" in i and "list" in i:
-                        for j in i['list']:
-                            if "name" in j and "data" in j and "check" in __import__(j['name']).__dict__:
-                                try:
-                                    ret = __import__(j['name']).check(j['data'])
-                                    if ret:
-                                        msg.append("%s %s" % (i['ip'], ret))
-                                except (Exception, ):
-                                    self.logger("Check %s.%s Error!" % (i['ip'], j['name']))
+                    for j in i['list']:
+                        if "check" in gRemoteModules.get(j['name'], {}):
+                            try:
+                                cache.setdefault(j['name'], {'status': True, 'cache': {}})
+                                checkRet, checkMsg = gRemoteModules[j['name']]['check'](
+                                    data=j['data'], cache=cache[j['name']]['cache'])
+
+                                if not checkRet:
+                                    cache[j['name']]['status'] = False
+                                    msg.append("%s %s" % (i['ip'], checkMsg))
+                                else:
+                                    if not cache[j['name']]['status']:
+                                        cache[j['name']]['status'] = True
+                                        msg.append("%s %s" % (i['ip'], checkMsg))
+
+                            except (Exception, ):
+                                self.logger("Check %s.%s Error!" % (i['ip'], j['name']))
 
                 if msg:
-                    sendMsgToWx("\n".join(map(lambda x: "%s %s %s" % (
-                        datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        config.ProjectName, x
-                    ), filter(lambda x: x != "", msg))))
+                    sendMsgToWx(msg="\n".join(map(lambda x: "%s %s" % (config.ProjectName, x),
+                                              filter(lambda x: x != "", msg))))
 
-            time.sleep(60)
+            time.sleep(config.NoticeInterval)
 
 
 def cdhServerStatus(cache):
-    cdh_status = list()
+    cdh_status = set()
     cache.setdefault('cdh_status', set())
+    cache.setdefault('cdh_notice', dict())
 
     host = "http://%s/api/v11/clusters/cluster1/services" % config.CDH[0]
     try:
@@ -193,18 +193,35 @@ def cdhServerStatus(cache):
         "GET", host, headers=headers,
         auth=HTTPBasicAuth(config.CdhUser, config.CdhPassword))
     ret.raise_for_status()
+
+    normal = set()
     for i in ret.json()['items']:
         if i['healthSummary'] != 'GOOD':
             if i['name'] not in cache['cdh_status']:
-                cdh_status.append(i['name'])
+                cdh_status.add(i['name'])
                 cache['cdh_status'].add(i['name'])
         else:
-            cache['cdh_status'].remove(i['name'])
+            if i['name'] in cache['cdh_status']:
+                cache['cdh_status'].remove(i['name'])
+                normal.add(i['name'])
+
+    for service in cdh_status:
+        cache['cdh_notice'].setdefault(service, config.NoticeMaxCount)
+        if cache['cdh_notice'][service]:
+            cache['cdh_notice'][service] -= 1
+        else:
+            cdh_status.remove(service)
+
+    for service in normal:
+        cache['cdh_notice'][service] = config.NoticeMaxCount
 
     if cdh_status:
-        return "CDH %s" % ",".join(cdh_status)
-    else:
-        return ""
+        return u"CDH异常组件 %s" % ",".join(cdh_status)
+
+    if normal:
+        return u"CDH恢复正常组件 %s" % ",".join(normal)
+
+    return ""
 
 
 def sparkTaskStatus(cache):
@@ -237,7 +254,7 @@ def sparkTaskStatus(cache):
 
 def mysqlSyncStatus(cache):
     cmd = "mysql -u{User} -p{Password} -h{Host} -P{Port} -e 'show slave status \\G'"
-    cache.setdefault('mysql', True)
+    cache.setdefault('mysql', config.NoticeMaxCount)
 
     for h in config.Mysql:
         ip, port = h.split(':')
@@ -250,9 +267,11 @@ def mysqlSyncStatus(cache):
         p.close()
 
         if "Slave_IO_Running: Yes" not in ret and "Slave_SQL_Running: Yes" not in ret and cache['mysql']:
-            cache['mysql'] = False
+            cache['mysql'] -= 1
             return u"Mysql 同步异常:%s" % ip
-    cache['mysql'] = True
+    if cache['mysql'] != config.NoticeMaxCount:
+        cache['mysql'] = config.NoticeMaxCount
+        return u"Mysql 同步回复正常"
     return ""
 
 
@@ -311,9 +330,26 @@ class Server(threading.Thread):
         self.socket.close()
 
 
-def sendMsgToWx(msg):
-    print "SENDMAS: ", msg
+class Gitee(threading.Thread):
+    def run(self):
+        while 1:
+            global gRemoteModules
+            os.system("rm -rf %s/.git" % os.getcwd()+"/script")
+            os.system("git clone {GiteePath} {LocalPath} --depth=1".format(
+                GiteePath=config.GiteePath, LocalPath=os.getcwd()+"/script"))
 
+            ruler = ["master" if "master" in socket.gethostname() else "node"][0]
+            for name in map(lambda x: x.replace('.py', ''),
+                            filter(lambda x: ".py" in x and ".pyc" not in x,
+                                   os.listdir(os.getcwd() + "/script"))):
+                scriptModule = __import__(name)
+                if "Ruler" not in scriptModule.__dict__ or scriptModule.Ruler in ['universal', ruler]:
+                    gRemoteModules[name] = __import__(name).__dict__
+
+            time.sleep(config.GiteeCheckInterval)
+
+
+def sendMsgToWx(msg):
     def get_token():
         token_url = 'https://qyapi.weixin.qq.com/cgi-bin/gettoken'
         values = {
@@ -323,18 +359,20 @@ def sendMsgToWx(msg):
         req = requests.post(token_url, params=values)
         data = json.loads(req.text)
         return data["access_token"]
-
-    wx_url = "https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=" + get_token()
-    requests.post(wx_url, data=json.dumps({
-        "touser": "@all",
-        "toparty": "@all",
-        "msgtype": "text",
-        "agentid": config.WxAppID,
-        "text": {
-            "content": msg
-        },
-        "safe": 0
-    }, ensure_ascii=False).encode("UTF-8"))
+    try:
+        wx_url = "https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=" + get_token()
+        requests.post(wx_url, data=json.dumps({
+            "touser": "@all",
+            "toparty": "@all",
+            "msgtype": "text",
+            "agentid": config.WxAppID,
+            "text": {
+                "content": "%s %s" % (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:$S"), msg)
+            },
+            "safe": 0
+        }, ensure_ascii=False).encode("UTF-8"))
+    except (Exception, ):
+        pass
 
 
 def settleLog():
@@ -370,5 +408,7 @@ def main():
 
         zkCli.stop()
 
+
 if __name__ == '__main__':
+    gRemoteModules = {}
     main()

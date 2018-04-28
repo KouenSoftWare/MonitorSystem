@@ -1,0 +1,3 @@
+[submodule "iDataMonitorScript"]
+	path = iDataMonitorScript
+	url = https://rbds:rbds4bd00@gitee.com/rbds/iDataMonitorScript.git
