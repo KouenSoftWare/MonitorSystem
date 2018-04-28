@@ -388,7 +388,13 @@ def settleLog():
 
 def main():
     logger = settleLog()
+    git = Gitee()
+    git.start()
     while 1:
+        if not git.isAlive():
+            git = Gitee()
+            git.start()
+
         zkCli = ZooKeeper(logger=logger)
         if zkCli.acquire():
             logger.info("election: i'm server")
